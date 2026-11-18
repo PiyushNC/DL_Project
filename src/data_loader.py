@@ -12,7 +12,7 @@ import tensorflow as tf
 from PIL import Image, UnidentifiedImageError
 
 from src.config import CONFIG
-from src.preprocessing import create_training_augmentation
+from src.preprocessing import create_training_augmentation, preprocess_for_model
 
 LOGGER = logging.getLogger(__name__)
 
@@ -62,6 +62,44 @@ def find_dataset_directory(dataset_dir: Path) -> Path:
     )
 
 
+def validate_three_crop_classes(class_names: list[str]) -> dict:
+    """Validate detected classes against the approved three-crop allowlist."""
+    intended = set(CONFIG.intended_classes)
+    detected = set(class_names)
+    unexpected = sorted(detected - intended)
+    missing = sorted(intended - detected)
+
+    result = {
+        "detected_class_count": len(class_names),
+        "target_class_count": CONFIG.target_class_count,
+        "intended_class_count": len(intended),
+        "target_crops": list(CONFIG.target_crop_names),
+        "detected_classes": class_names,
+        "missing_intended_classes": missing,
+        "unexpected_classes": unexpected,
+        "target_18_verified": len(class_names) == CONFIG.target_class_count
+        and not unexpected,
+    }
+    if unexpected:
+        raise ValueError(
+            "Unexpected classes found outside the approved three-crop allowlist: "
+            + ", ".join(unexpected)
+        )
+    if missing:
+        LOGGER.warning(
+            "Missing intended classes: %s",
+            ", ".join(missing),
+        )
+    if len(class_names) != CONFIG.target_class_count:
+        LOGGER.warning(
+            "Dataset mismatch: detected %d classes, but the approved target "
+            "is %d; no 18-class claim is made.",
+            len(class_names),
+            CONFIG.target_class_count,
+        )
+    return result
+
+
 @dataclass(frozen=True)
 class ImageRecord:
     path: Path
@@ -97,12 +135,15 @@ def _hamming_distance(left: int, right: int) -> int:
 
 def _group_near_duplicates(records: list[ImageRecord], threshold: int = 5) -> list[list[ImageRecord]]:
     """Keep near-identical images together so one split does not leak them."""
-    buckets: dict[int, list[int]] = {}
+    prefix_buckets: dict[int, list[int]] = {}
+    suffix_buckets: dict[int, list[int]] = {}
     representative_groups: list[list[ImageRecord]] = []
 
     for record in records:
-        bucket = record.perceptual_hash >> 48
-        candidate_indexes = buckets.setdefault(bucket, [])
+        prefix = record.perceptual_hash >> 56
+        suffix = record.perceptual_hash & 0xFF
+        candidate_indexes = set(prefix_buckets.setdefault(prefix, []))
+        candidate_indexes.update(suffix_buckets.setdefault(suffix, []))
         matching_group = None
 
         for representative_index in candidate_indexes:
@@ -114,7 +155,8 @@ def _group_near_duplicates(records: list[ImageRecord], threshold: int = 5) -> li
         if matching_group is None:
             matching_group = len(representative_groups)
             representative_groups.append([])
-            candidate_indexes.append(matching_group)
+        prefix_buckets[prefix].append(matching_group)
+        suffix_buckets[suffix].append(matching_group)
 
         representative_groups[matching_group].append(record)
 
@@ -131,6 +173,7 @@ def inspect_dataset_directory(dataset_dir: Path) -> tuple[list[str], list[Path],
     )
     if not class_names:
         raise ValueError(f"No class folders were found in {dataset_dir}")
+    validate_three_crop_classes(class_names)
 
     usable: list[Path] = []
     class_counts: Counter = Counter()
@@ -183,6 +226,7 @@ def create_splits(
     seed: int = CONFIG.seed,
     train_ratio: float = 0.70,
     validation_ratio: float = 0.15,
+    manifest_path: Path | None = None,
 ) -> tuple[list[ImageRecord], list[ImageRecord], list[ImageRecord], list[str]]:
     """Create deterministic, duplicate-safe stratified file splits."""
     if train_ratio + validation_ratio >= 1.0:
@@ -195,6 +239,8 @@ def create_splits(
     train_records: list[ImageRecord] = []
     val_records: list[ImageRecord] = []
     test_records: list[ImageRecord] = []
+    exact_duplicate_count = 0
+    near_duplicate_count = 0
 
     for class_index, class_name in enumerate(class_names):
         class_paths = [
@@ -208,6 +254,7 @@ def create_splits(
             try:
                 exact_hash = _exact_hash(path)
                 if exact_hash in exact_hashes:
+                    exact_duplicate_count += 1
                     LOGGER.warning(
                         "Skipping exact duplicate in class %s: %s",
                         class_name,
@@ -235,6 +282,7 @@ def create_splits(
             )
 
         groups = _group_near_duplicates(records)
+        near_duplicate_count += sum(max(0, len(group) - 1) for group in groups)
         rng.shuffle(groups)
         if len(groups) < 3:
             raise ValueError(
@@ -291,13 +339,32 @@ def create_splits(
     rng.shuffle(val_records)
     rng.shuffle(test_records)
 
-    CONFIG.splits_path.parent.mkdir(parents=True, exist_ok=True)
-    CONFIG.splits_path.write_text(
+    manifest_path = manifest_path or CONFIG.splits_path
+    manifest_path.parent.mkdir(parents=True, exist_ok=True)
+    validation = validate_three_crop_classes(class_names)
+    portable_splits: dict[str, dict[str, list[str]]] = {}
+    dataset_root = dataset_dir.resolve()
+    for class_name, split_paths in split_manifest.items():
+        portable_splits[class_name] = {}
+        for split_name, absolute_paths in split_paths.items():
+            portable_splits[class_name][split_name] = [
+                str(Path(path).resolve().relative_to(dataset_root))
+                if Path(path).resolve().is_relative_to(dataset_root)
+                else str(path)
+                for path in absolute_paths
+            ]
+
+    split_manifest = portable_splits
+    manifest_path.write_text(
         json.dumps(
             {
                 "seed": seed,
                 "train_ratio": train_ratio,
                 "validation_ratio": validation_ratio,
+                "dataset_root": str(dataset_root),
+                "dataset_validation": validation,
+                "exact_duplicate_count": exact_duplicate_count,
+                "near_duplicate_count": near_duplicate_count,
                 "classes": class_names,
                 "splits": split_manifest,
             },
@@ -305,7 +372,7 @@ def create_splits(
         ),
         encoding="utf-8",
     )
-    LOGGER.info("Saved split manifest to %s", CONFIG.splits_path)
+    LOGGER.info("Saved split manifest to %s", manifest_path)
 
     train_paths = {record.path.resolve() for record in train_records}
     val_paths = {record.path.resolve() for record in val_records}
@@ -327,6 +394,7 @@ def create_datasets(
     image_size: tuple[int, int] | None = None,
     batch_size: int = CONFIG.batch_size,
     seed: int = CONFIG.seed,
+    model_name: str | None = None,
 ) -> tuple[tf.data.Dataset, tf.data.Dataset, tf.data.Dataset, list[str]]:
     """Create deterministic 70/15/15 train, validation, and test datasets."""
     image_size = image_size or CONFIG.image_size
@@ -346,6 +414,13 @@ def create_datasets(
         image.set_shape((None, None, 3))
         image = tf.image.resize(image, image_size)
         image = tf.cast(image, tf.float32)
+        if model_name:
+            image = tf.numpy_function(
+                lambda values: preprocess_for_model(values, model_name),
+                inp=[image],
+                Tout=tf.float32,
+            )
+            image.set_shape((*image_size, 3))
         return image, tf.one_hot(label, depth=num_classes)
 
     def make_dataset(records: list[ImageRecord], shuffle: bool):

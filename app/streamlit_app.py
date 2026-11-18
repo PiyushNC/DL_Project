@@ -15,6 +15,17 @@ from src.config import CONFIG
 from src.disease_info import get_disease_information
 from src.predict import PredictionService
 from src.preprocessing import load_validated_image
+from src.gradcam_pp import generate_gradcam_pp
+
+
+def active_model_path() -> Path:
+    if CONFIG.leafdoc_model_path.exists():
+        return CONFIG.leafdoc_model_path
+    return CONFIG.model_path
+
+
+def leafdoc_available() -> bool:
+    return CONFIG.leafdoc_model_path.exists()
 
 logging.basicConfig(
     level=logging.INFO,
@@ -114,21 +125,24 @@ if "prediction" not in st.session_state:
 
 
 @st.cache_resource
-def load_prediction_service() -> PredictionService:
+def load_prediction_service(model_path: Path) -> PredictionService:
     return PredictionService(
-        model_path=CONFIG.model_path,
+        model_path=model_path,
         class_names_path=CONFIG.class_names_path,
         image_size=CONFIG.image_size,
     )
 
 
 def model_available() -> bool:
-    return CONFIG.model_path.exists() and CONFIG.class_names_path.exists()
+    return active_model_path().exists() and CONFIG.class_names_path.exists()
 
 
 def model_status_badge() -> None:
     if model_available():
-        st.success("Trained model available")
+        if leafdoc_available():
+            st.success("Hybrid LeafDoc-Net model available")
+        else:
+            st.success("MobileNetV2 model available")
     else:
         st.warning("Trained model not available")
 
@@ -140,8 +154,9 @@ def page_home() -> None:
             <div style="font-size:2.2rem;">🌿</div>
             <h1>LeafLens</h1>
             <h3 style="color:#466653;">AI-Powered Plant Disease Classification</h3>
-            <p>Explore leaf health with a lightweight MobileNetV2 model trained for
-            PlantVillage-style plant disease image classification.</p>
+            <p>Explore leaf health with a DenseNet121 and MobileNetV2 hybrid model
+            when available, or the existing MobileNetV2 model as a documented
+            fallback.</p>
         </div>
         """,
         unsafe_allow_html=True,
@@ -195,6 +210,12 @@ def page_detection() -> None:
     with action:
         st.write("**Analysis controls**")
         analyze = st.button("Analyze Image", use_container_width=True)
+        show_gradcam = st.checkbox(
+            "Show Grad-CAM++",
+            value=leafdoc_available(),
+            disabled=not leafdoc_available(),
+            help="Available only with a trained hybrid LeafDoc-Net model.",
+        )
         if st.button("Upload Another Image", use_container_width=True):
             st.session_state.uploaded_version += 1
             st.session_state.prediction = None
@@ -204,14 +225,15 @@ def page_detection() -> None:
         if not model_available():
             st.error(
                 "The trained model or class mapping is missing. "
-                "Run `python -m src.train --dataset data/raw` before analysis."
+                "Run the MobileNet baseline or LeafDoc-Net training command "
+                "before analysis."
             )
             st.session_state.prediction = None
             return
 
         try:
             with st.spinner("Analyzing leaf features…"):
-                service = load_prediction_service()
+                service = load_prediction_service(active_model_path())
                 label, confidence, top_three = service.predict(image, top_k=3)
             st.session_state.prediction = {
                 "label": label,
@@ -265,6 +287,33 @@ def page_detection() -> None:
         hide_index=True,
     )
 
+    if show_gradcam and leafdoc_available():
+        st.subheader("Original Image vs Grad-CAM++")
+        try:
+            with st.spinner("Generating class-specific Grad-CAM++ overlays…"):
+                service = load_prediction_service(active_model_path())
+                class_index = service.class_names.index(prediction["label"])
+                _, overlays = generate_gradcam_pp(
+                    service.model,
+                    image,
+                    class_index=class_index,
+                    branch="both",
+                    alpha=0.45,
+                )
+            original_column, heatmap_column = st.columns(2)
+            with original_column:
+                st.image(image, caption="Original leaf image", use_container_width=True)
+            with heatmap_column:
+                st.image(
+                    overlays["both"],
+                    caption="Hybrid Grad-CAM++",
+                    use_container_width=True,
+                )
+        except Exception as exc:
+            st.warning(
+                f"Grad-CAM++ could not be generated for this image: {exc}"
+            )
+
     st.subheader("Disease Information")
     info_left, info_right = st.columns(2)
     with info_left:
@@ -282,8 +331,12 @@ def page_detection() -> None:
 
 
 def load_evaluation_metrics() -> dict | None:
-    path = CONFIG.metrics_dir / "test_metrics.json"
-    if not path.exists():
+    candidates = (
+        CONFIG.metrics_dir / "leafdoc_net" / "test_metrics.json",
+        CONFIG.metrics_dir / "test_metrics.json",
+    )
+    path = next((candidate for candidate in candidates if candidate.exists()), None)
+    if path is None:
         return None
     try:
         return json.loads(path.read_text(encoding="utf-8"))
@@ -295,6 +348,10 @@ def load_evaluation_metrics() -> dict | None:
 def page_performance() -> None:
     st.title("Model Performance")
     st.caption("Results loaded only from saved artifacts generated by evaluation.")
+    if leafdoc_available():
+        st.caption("Artifact label: Hybrid LeafDoc-Net")
+    else:
+        st.caption("Artifact label: Existing MobileNetV2 baseline")
 
     metrics = load_evaluation_metrics()
     if metrics is None:
@@ -329,14 +386,22 @@ def page_performance() -> None:
             )
 
     st.subheader("Confusion Matrix")
-    confusion_path = CONFIG.plots_dir / "confusion_matrix.png"
+    confusion_path = (
+        CONFIG.plots_dir / "leafdoc_net" / "confusion_matrix.png"
+        if (CONFIG.plots_dir / "leafdoc_net" / "confusion_matrix.png").exists()
+        else CONFIG.plots_dir / "confusion_matrix.png"
+    )
     if confusion_path.exists():
         st.image(str(confusion_path), use_container_width=True)
     else:
         st.info("No saved confusion matrix is available.")
 
     st.subheader("Training and Validation Curves")
-    training_path = CONFIG.plots_dir / "training_history.png"
+    training_path = (
+        CONFIG.plots_dir / "leafdoc_training_history.png"
+        if (CONFIG.plots_dir / "leafdoc_training_history.png").exists()
+        else CONFIG.plots_dir / "training_history.png"
+    )
     if training_path.exists():
         st.image(str(training_path), use_container_width=True)
     else:
@@ -371,9 +436,10 @@ def page_about() -> None:
             can help users prioritize closer inspection and expert support.
 
             ### Solution
-            LeafLens uses a pretrained MobileNetV2 model with a custom plant-disease
-            classification head. It accepts a leaf image and ranks the possible
-            PlantVillage classes.
+            LeafLens uses the trained LeafDoc-Net hybrid when available:
+            DenseNet121 and MobileNetV2 features are combined through the
+            project’s attention and fusion components. If the hybrid checkpoint
+            is absent, the app clearly uses the existing MobileNetV2 fallback.
 
             ### Reproducibility
             The project uses fixed random seeds where supported, a saved split
@@ -388,10 +454,11 @@ def page_about() -> None:
             training all parameters from scratch. Initially, the MobileNetV2 base
             is frozen while a lightweight head learns disease classes.
 
-            ### MobileNetV2
-            MobileNetV2 is suitable for a college laboratory because it combines
-            depthwise separable convolutions with an efficient lightweight
-            architecture and supports optional upper-layer fine-tuning.
+            ### Hybrid Components
+            DenseNet121 and MobileNetV2 each extract complementary features.
+            DenseNet uses attentive transition, and MobileNetV2 uses sigmoid
+            attention. Global-average-pooled vectors are concatenated before the
+            1024 → 512 → 128 dense classification head.
 
             ### PlantVillage
             PlantVillage contains leaf images organized into plant/disease folders.
@@ -402,9 +469,10 @@ def page_about() -> None:
 
     st.subheader("Architecture")
     st.code(
-        "Leaf image → Resize 224×224 → MobileNetV2 preprocessing\n"
-        "→ MobileNetV2 feature base → Global Average Pooling\n"
-        "→ Dropout → Softmax disease classes",
+        "Leaf image → 224×224 RGB\n"
+        "→ DenseNet121 + attentive transition ┐\n"
+        "→ MobileNetV2 + sigmoid attention ── Concatenate + GAP\n"
+        "→ 1024/512/128 dense head → Softmax",
         language="text",
     )
 

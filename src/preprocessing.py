@@ -18,6 +18,30 @@ def create_training_augmentation(seed: int) -> tf.keras.Sequential:
     )
 
 
+def preprocess_for_model(
+    pixels: np.ndarray,
+    model_name: str,
+) -> np.ndarray:
+    """Apply the framework preprocessing required by a supported backbone."""
+    normalized_name = model_name.strip().lower().replace("-", "").replace("_", "")
+    pixels = np.asarray(pixels, dtype=np.float32)
+
+    if normalized_name in {"mobilenetv2", "mobilenet"}:
+        return np.asarray(
+            tf.keras.applications.mobilenet_v2.preprocess_input(pixels)
+        )
+    if normalized_name in {"densenet121", "densenet"}:
+        scaled = pixels / 255.0
+        mean = np.asarray([0.485, 0.456, 0.406], dtype=np.float32)
+        std = np.asarray([0.229, 0.224, 0.225], dtype=np.float32)
+        return (scaled - mean) / std
+
+    raise ValueError(
+        f"Unsupported model preprocessing '{model_name}'. "
+        "Supported values: mobilenetv2, densenet121."
+    )
+
+
 def preprocess_image(image: Image.Image, image_size: tuple[int, int]) -> np.ndarray:
     """Convert a PIL image to a raw inference batch for the model pipeline."""
     if image is None:

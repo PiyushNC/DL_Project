@@ -9,6 +9,7 @@ from PIL import Image
 from src.config import CONFIG
 from src.data_loader import create_splits
 from src.preprocessing import load_validated_image, preprocess_image
+from src.model import AttentiveTransition, MobileAttention
 
 LOGGER = logging.getLogger(__name__)
 
@@ -31,7 +32,13 @@ class PredictionService:
                 f"Class names not found: {class_names_path}. Train the model first."
             )
 
-        self.model = tf.keras.models.load_model(model_path)
+        self.model = tf.keras.models.load_model(
+            model_path,
+            custom_objects={
+                "AttentiveTransition": AttentiveTransition,
+                "MobileAttention": MobileAttention,
+            },
+        )
         self.image_size = image_size
         self.class_names = json.loads(
             class_names_path.read_text(encoding="utf-8")
